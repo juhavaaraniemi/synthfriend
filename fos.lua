@@ -1,4 +1,4 @@
--- friend of synths
+-- twister16
 --
 -- 16 ccs total
 -- 4 in each bank
@@ -18,6 +18,8 @@
 --
 pattern_time = require 'pattern_time'
 musicutil = require 'musicutil'
+MollyThePoly = require "molly_the_poly/lib/molly_the_poly_engine"
+engine.name = "MollyThePoly"
 
 --
 -- DEVICES
@@ -28,14 +30,15 @@ m = midi.connect()
 --
 -- VARIABLES
 --
+PATH = _path.data.."twister16/"
 bank = 1
 bank_size = 4
 bank_start = 0
 cc = 1
 cc_value = {}
 active_midi_notes = {}
-grid_dirty = false
-screen_dirty = false
+grid_dirty = true
+screen_dirty = true
 for i=1,64 do
   cc_value[i] = 0
 end
@@ -43,6 +46,10 @@ scale_names = {}
 for i = 1, #musicutil.SCALES do
   table.insert(scale_names, musicutil.SCALES[i].name)
 end
+MAX_NUM_VOICES = 16
+nvoices = 0
+lit = {}
+pat_timer = {}
 
 
 
@@ -73,6 +80,7 @@ function init_parameters()
     options=scale_names,
     default=41,
     action=function()
+      all_notes_off()
       build_scale()
     end
   }
@@ -87,6 +95,7 @@ function init_parameters()
       return musicutil.note_num_to_name(param:get(),true)
     end,
     action=function(value)
+      all_notes_off()
       build_scale()
     end
   }
@@ -106,10 +115,17 @@ function init_parameters()
     max=12,
     default=5,
     action=function(value)
+      all_notes_off()
       build_scale()
     end
   }
 end
+
+function init_engine()
+  params:add_separator()
+  MollyThePoly.add_params()
+end
+
 
 function init_grid()
   momentary = {}
@@ -125,25 +141,76 @@ function init_pattern_recorders()
   cc1_pattern = pattern_time.new()
   cc1_pattern.process = parse_cc1_pattern
   
-  grid_pattern = pattern_time.new()
-  grid_pattern.process = parse_grid_pattern
+--  grid_pattern = pattern_time.new()
+--  grid_pattern.process = grid_note
   
---  grid_pattern = {}
---  for i=1,7 do
---    grid_pattern[i] = pattern_time.new()
---      grid_pattern[i].process = parse_grid_pattern..i
---  end
+  grid_pattern = {}
+  for i=1,7 do
+    grid_pattern[i] = pattern_time.new()
+    grid_pattern[i].process = grid_note
+  end
+  active_grid_pattern = 1
 end
 
 function init()
   init_parameters()
-  init_grid()
+  init_engine()
   build_scale()
   init_pattern_recorders()
+  init_pset_callbacks()
   grid_redraw()
   redraw()
   clock.run(grid_redraw_clock)
   clock.run(redraw_clock)
+end
+
+
+--
+-- CALLBACK FUNCTIONS
+--
+function init_pset_callbacks()
+  params.action_write = function(filename,name,number)
+    print("finished writing '"..filename.."' as '"..name.."'")
+    
+    local pattern_data = {}
+    for i=1,7 do
+      local pattern_file = PATH..number.."_pattern_"..i..".pdata"
+      if grid_pattern[i].count > 0 then
+        pattern_data[i] = {}
+        pattern_data[i].event = grid_pattern[i].event
+        pattern_data[i].time = grid_pattern[i].time
+        pattern_data[i].count = grid_pattern[i].count
+        pattern_data[i].time_factor = grid_pattern[i].time_factor
+        tab.save(pattern_data[i],pattern_file)
+      else
+        if util.file_exists(pattern_file) then
+          os.execute("rm "..pattern_file)
+        end    
+      end
+    end
+  end
+  
+  params.action_read = function(filename,silent,number)
+    print("finished reading '"..filename.."'")
+    local pset_file = io.open(filename, "r")
+    local pattern_data = {}
+    for i=1,7 do
+      local pattern_file = PATH..number.."_pattern"..i..".pdata"
+      if util.file_exists(pattern_file) then
+        pattern_data[i] = {}
+        grid_pattern[i]:rec_stop()
+        grid_pattern[i]:stop()
+        grid_pattern[i]:clear()
+        pattern_data[i] = tab.load(pattern_file)
+        for k,v in pairs(pattern_data[i]) do
+          grid_pattern[i][k] = v
+        end
+      end
+    end
+  
+    grid_dirty = true
+    screen_dirty = true
+  end
 end
 
 
@@ -182,35 +249,37 @@ function record_cc1_value()
   )
 end
 
-function record_grid_value()
-  grid_pattern:watch(
-    {
-      ["value"] = cc_value[1]
-    }
-  )
-end
-
 function parse_cc1_pattern(data)
   cc_value[1] = data.value
 end
 
 
 --
--- MIDI FUNCTIONS
+-- NOTE FUNCTIONS
 --
-function note_on(note_num, vel, chan)
-  m:note_on(note_num, vel, chan)
+function note_on(note_num, vel)
+  --m:note_on(note_num, vel)
+  engine.noteOn(note_num, musicutil.note_num_to_freq(note_num), vel)
   if active_midi_notes[note_num] == nil then
     active_midi_notes[note_num] = true
   end
   print("note_on:"..musicutil.note_num_to_name(note_num,true))
 end
 
-function note_off(note_num, chan)
-  m:note_off(note_num, chan)
+function note_off(note_num)
+  --m:note_off(note_num)
+  engine.noteOff(note_num)
   active_midi_notes[note_num] = nil
   --print("note_off:"..musicutil.note_num_to_name(note_num,true))
 end
+
+function all_notes_off()
+--  for k,v in pairs(active_midi_notes) do
+--    note_off(v)
+--  end
+  engine.noteOffAll()
+end
+  
 
 function build_scale()
   if params:get("scale") ~= 41 then
@@ -242,6 +311,29 @@ function build_scale()
   grid_dirty = true
 end
 
+function grid_note(e)
+  --local note = ((7-e.y)*5) + e.x
+  if e.state > 0 then
+    if nvoices < MAX_NUM_VOICES then
+      --start_note(e.id, note)
+      note_on(midi_note[e.y][e.x].value,params:get("velocity"))
+      lit[e.id] = {}
+      lit[e.id].x = e.x
+      lit[e.id].y = e.y
+      nvoices = nvoices + 1
+    end
+  else
+    if lit[e.id] ~= nil then
+      --engine.stop(e.id)
+      note_off(midi_note[e.y][e.x].value)
+      lit[e.id] = nil
+      nvoices = nvoices - 1
+    end
+  end
+  grid_redraw()
+end
+
+
 --
 -- UI FUNCTIONS
 --
@@ -250,12 +342,17 @@ function key(n,z)
     shifted = z == 1
   elseif shifted and n == 2 and z == 1 then
     print("RECORD")
-    cc1_pattern:rec_start()
-    record_cc1_value()
+    grid_pattern:stop()
+    grid_pattern:clear()
+    grid_pattern:rec_start()
+    --cc1_pattern:rec_start()
+    --record_cc1_value()
   elseif shifted and n == 3 and z == 1 then
     print("STOP REC AND PLAY")
-    cc1_pattern:rec_stop()
-    cc1_pattern:start()
+    --cc1_pattern:rec_stop()
+    --cc1_pattern:start()
+    grid_pattern:rec_stop()
+    grid_pattern:start()
   elseif n == 2 and z == 1 then
     bank = util.clamp(bank - 1,1,4)
     bank_start = (bank-1)*bank_size
@@ -285,13 +382,53 @@ function enc(n,d)
 end
 
 function g.key(x,y,z)
-  --momentary[x][y] = z == 1 and true or false
-  if z == 1 then
-    momentary[x][y] = true
-    note_on(midi_note[y][x].value,params:get("velocity"),params:get("note_channel"))
-  else
-    momentary[x][y] = false
-    note_off(midi_note[y][x].value,params:get("note_channel"))
+  -- pattern recorders
+  if y == 8 then
+    if x < 8 then
+      active_grid_pattern = x
+      if z == 1 then
+        pat_timer[x] = clock.run(pattern_long_press,x)
+      elseif z == 0 then
+        if pat_timer[x] then
+          clock.cancel(pat_timer[x])
+          pattern_short_press(x)
+        end
+      end
+    end
+
+  -- notes
+  elseif y < 8 then
+    local e = {}
+    e.id = x*8 + y
+    e.x = x
+    e.y = y
+    e.state = z
+    grid_pattern[active_grid_pattern]:watch(e)
+    grid_note(e)
+  end
+  grid_dirty = true
+end
+
+function pattern_long_press(x)
+  clock.sleep(0.5)
+  grid_pattern[x]:stop()
+  grid_pattern[x]:clear()
+  pat_timer[x] = nil
+  grid_dirty = true
+end
+
+function pattern_short_press(x)
+  if grid_pattern[x].rec == 0 and grid_pattern[x].count == 0 then
+    grid_pattern[x]:stop()
+    grid_pattern[x]:rec_start()
+  elseif grid_pattern[x].rec == 1 then
+    grid_pattern[x]:rec_stop()
+    grid_pattern[x]:start()
+  elseif grid_pattern[x].play == 1 then
+    grid_pattern[x]:stop()
+    all_notes_off()
+  elseif grid_pattern[x].play == 0 and grid_pattern[x].count > 0 then
+    grid_pattern[x]:start()
   end
   grid_dirty = true
 end
@@ -326,6 +463,18 @@ end
 
 function grid_redraw()
   g:all(0)
+  for x = 1,7 do
+    if grid_pattern[x].play == 1 then
+      g:led(x,8,10)
+    elseif grid_pattern[x].rec == 1 then
+      g:led(x,8,15)
+    elseif grid_pattern[x].play == 0 and grid_pattern[x].count > 0 then
+      g:led(x,8,7)
+    else
+      g:led(x,8,4)
+    end
+  end
+
   for x = 1,16 do
     for y = 7,1,-1 do
       -- scale notes
@@ -337,10 +486,15 @@ function grid_redraw()
         g:led(x,y,8)
       end
       -- lit when pressed
-      if momentary[x][y] then
-        g:led(x,y,15)
-      end
+      -- if momentary[x][y] then
+      --  g:led(x,y,15)
+      -- end
     end
+  end
+  
+  -- lit when pressed
+  for i,e in pairs(lit) do
+    g:led(e.x, e.y,15)
   end
   g:refresh()
 end
